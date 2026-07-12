@@ -1307,8 +1307,9 @@ struct obs_output {
 	struct dynamic_delay_buffer *dynamic_delay_buf;
 	bool dynamic_delay_enabled;
 	int dynamic_delay_target_sec;
+	int dynamic_delay_mode; /* 0 = Waiting Media, 1 = Replay */
 	char *dynamic_delay_waiting_media;
-	int dynamic_delay_state;                     /* 0=LIVE, 1=ACCUMULATING, 2=DELAYED, 3=CATCHUP */
+	int dynamic_delay_state;                     /* 0=LIVE, 1=ACCUMULATING, 2=DELAYED, 3=CATCHUP, 4=ACCUMULATING_REPLAY */
 	struct dyn_delay_media *dynamic_delay_media; /* waiting media pipeline */
 	bool dynamic_delay_wait_keyframe;            /* buffering starts on a video keyframe */
 	/* wire timeline bookkeeping, indexed [0]=video, [1]=audio */

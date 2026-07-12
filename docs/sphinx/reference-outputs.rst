@@ -856,6 +856,24 @@ General Output Functions
 
 ---------------------
 
+.. function:: void obs_output_set_dynamic_delay_mode(obs_output_t *output, int mode)
+
+   Sets the dynamic delay mode.
+
+   :param mode: 0 for Waiting Media (looping media during delay accumulation), 1 for Replay Accumulated (stream live during accumulation, then replay from start of buffer once target duration is reached)
+
+   .. versionadded:: 32.2.0
+
+---------------------
+
+.. function:: int obs_output_get_dynamic_delay_mode(const obs_output_t *output)
+
+   Gets the currently configured dynamic delay mode (0 = Waiting Media, 1 = Replay Accumulated).
+
+   .. versionadded:: 32.2.0
+
+---------------------
+
 .. function:: int obs_output_get_dynamic_delay_state(const obs_output_t *output)
 
    Gets the current dynamic delay state.
@@ -865,6 +883,7 @@ General Output Functions
             | 1 - ACCUMULATING, buffering up to the target duration
             | 2 - DELAYED, target reached; output is being fed from the buffer
             | 3 - CATCHUP, delay was disabled; buffer is draining back to live
+            | 4 - ACCUMULATING_REPLAY, streaming live while buffering up to target duration before replaying from start
 
    .. versionadded:: 32.2.0
 

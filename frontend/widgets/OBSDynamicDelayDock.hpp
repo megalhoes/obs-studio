@@ -11,10 +11,14 @@ class QPushButton;
 class QSlider;
 class QSpinBox;
 class QProgressBar;
+class QComboBox;
+class QGroupBox;
 
 class OBSDynamicDelayDock : public OBSDock {
 	Q_OBJECT
 
+	QGroupBox *mediaGroup = nullptr;
+	QComboBox *modeComboBox = nullptr;
 	QLineEdit *mediaPathEdit = nullptr;
 	QPushButton *browseBtn = nullptr;
 	QSlider *targetSlider = nullptr;
@@ -34,6 +38,7 @@ public:
 private slots:
 	void OnBrowseMedia();
 	void OnTargetDelayChanged(int value);
+	void OnModeChanged(int index);
 	void OnToggleDelay();
 	void UpdateStats();
 };

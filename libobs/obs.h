@@ -2204,11 +2204,18 @@ EXPORT void obs_output_set_dynamic_delay_waiting_media(obs_output_t *output, con
 /** Gets the currently configured waiting media path, or NULL if unset. */
 EXPORT const char *obs_output_get_dynamic_delay_waiting_media(const obs_output_t *output);
 
+/** Sets the dynamic delay mode: 0 for Waiting Media, 1 for Replay Accumulated. */
+EXPORT void obs_output_set_dynamic_delay_mode(obs_output_t *output, int mode);
+
+/** Gets the currently configured dynamic delay mode: 0 for Waiting Media, 1 for Replay Accumulated. */
+EXPORT int obs_output_get_dynamic_delay_mode(const obs_output_t *output);
+
 /** Gets the current dynamic delay state:
  *   0 - LIVE: no delay is active
  *   1 - ACCUMULATING: buffering up to the target duration
  *   2 - DELAYED: target reached; output is being fed from the buffer
- *   3 - CATCHUP: delay was disabled; buffer is draining back to live */
+ *   3 - CATCHUP: delay was disabled; buffer is draining back to live
+ *   4 - ACCUMULATING_REPLAY: streaming live while buffering; will replay from start once target reached */
 EXPORT int obs_output_get_dynamic_delay_state(const obs_output_t *output);
 
 /** Gets the amount of data currently buffered, in milliseconds. */

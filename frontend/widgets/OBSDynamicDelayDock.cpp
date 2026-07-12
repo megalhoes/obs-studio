@@ -12,6 +12,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QProgressBar>
+#include <QComboBox>
 #include <QFileDialog>
 #include <QStyle>
 #include <QScrollArea>
@@ -56,8 +57,22 @@ OBSDynamicDelayDock::OBSDynamicDelayDock(QWidget *parent) : OBSDock(QTStr("Basic
 	targetLayout->addLayout(sliderLayout);
 	mainLayout->addWidget(targetGroup);
 
-	// 2. Temporary Media Section (Fallback)
-	QGroupBox *mediaGroup = new QGroupBox(QTStr("Basic.DynamicDelay.MediaGroup"), mainWidget);
+	// 2. Mode Selection Section
+	QGroupBox *modeGroup = new QGroupBox(QTStr("Basic.DynamicDelay.ModeGroup"), mainWidget);
+	QVBoxLayout *modeLayout = new QVBoxLayout(modeGroup);
+
+	QLabel *modeHelp = new QLabel(QTStr("Basic.DynamicDelay.ModeHelp"), modeGroup);
+	modeHelp->setWordWrap(true);
+	modeLayout->addWidget(modeHelp);
+
+	modeComboBox = new QComboBox(modeGroup);
+	modeComboBox->addItem(QTStr("Basic.DynamicDelay.Mode.WaitingMedia"), 0);
+	modeComboBox->addItem(QTStr("Basic.DynamicDelay.Mode.Replay"), 1);
+	modeLayout->addWidget(modeComboBox);
+	mainLayout->addWidget(modeGroup);
+
+	// 3. Temporary Media Section (Fallback)
+	mediaGroup = new QGroupBox(QTStr("Basic.DynamicDelay.MediaGroup"), mainWidget);
 	QVBoxLayout *mediaLayout = new QVBoxLayout(mediaGroup);
 
 	QLabel *mediaHelp = new QLabel(QTStr("Basic.DynamicDelay.MediaHelp"), mediaGroup);
@@ -75,7 +90,7 @@ OBSDynamicDelayDock::OBSDynamicDelayDock(QWidget *parent) : OBSDock(QTStr("Basic
 	mediaLayout->addLayout(fileLayout);
 	mainLayout->addWidget(mediaGroup);
 
-	// 3. Status & Indicators Section
+	// 4. Status & Indicators Section
 	QGroupBox *statusGroup = new QGroupBox(QTStr("Basic.DynamicDelay.StatusGroup"), mainWidget);
 	QVBoxLayout *statusLayout = new QVBoxLayout(statusGroup);
 
@@ -100,7 +115,7 @@ OBSDynamicDelayDock::OBSDynamicDelayDock(QWidget *parent) : OBSDock(QTStr("Basic
 	statusLayout->addLayout(statsLayout);
 	mainLayout->addWidget(statusGroup);
 
-	// 4. Toggle Button
+	// 5. Toggle Button
 	toggleBtn = new QPushButton(QTStr("Basic.DynamicDelay.Enable"), mainWidget);
 	toggleBtn->setMinimumHeight(40);
 	QFont btnFont = toggleBtn->font();
@@ -117,6 +132,8 @@ OBSDynamicDelayDock::OBSDynamicDelayDock(QWidget *parent) : OBSDock(QTStr("Basic
 	// Connect signals
 	connect(targetSlider, &QSlider::valueChanged, this, &OBSDynamicDelayDock::OnTargetDelayChanged);
 	connect(targetSpinBox, &QSpinBox::valueChanged, this, &OBSDynamicDelayDock::OnTargetDelayChanged);
+	connect(modeComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		&OBSDynamicDelayDock::OnModeChanged);
 	connect(browseBtn, &QPushButton::clicked, this, &OBSDynamicDelayDock::OnBrowseMedia);
 	connect(toggleBtn, &QPushButton::clicked, this, &OBSDynamicDelayDock::OnToggleDelay);
 
@@ -144,6 +161,17 @@ void OBSDynamicDelayDock::OnTargetDelayChanged(int value)
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 	if (output) {
 		obs_output_set_dynamic_delay_target_sec(output, value);
+	}
+}
+
+void OBSDynamicDelayDock::OnModeChanged(int index)
+{
+	if (mediaGroup) {
+		mediaGroup->setVisible(index == 0);
+	}
+	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
+	if (output) {
+		obs_output_set_dynamic_delay_mode(output, index);
 	}
 }
 
@@ -208,6 +236,16 @@ void OBSDynamicDelayDock::UpdateStats()
 		obs_output_set_dynamic_delay_waiting_media(output, mediaPathEdit->text().toUtf8().constData());
 	}
 
+	// Sync mode if changed externally or on start
+	int mode = obs_output_get_dynamic_delay_mode(output);
+	if (modeComboBox && modeComboBox->currentIndex() != mode) {
+		modeComboBox->blockSignals(true);
+		modeComboBox->setCurrentIndex(mode);
+		modeComboBox->blockSignals(false);
+		if (mediaGroup)
+			mediaGroup->setVisible(mode == 0);
+	}
+
 	if (!enabled || state == 0) {
 		statusLabel->setText(QTStr("Basic.DynamicDelay.Status.Live"));
 		statusLabel->setStyleSheet(QStringLiteral("color: #4CAF50;")); // Green
@@ -224,6 +262,10 @@ void OBSDynamicDelayDock::UpdateStats()
 		statusLabel->setText(QTStr("Basic.DynamicDelay.Status.ReturningLive"));
 		statusLabel->setStyleSheet(QStringLiteral("color: #E91E63;")); // Pink/Purple
 		toggleBtn->setText(QTStr("Basic.DynamicDelay.Enable"));
+	} else if (state == 4) {
+		statusLabel->setText(QTStr("Basic.DynamicDelay.Status.AccumulatingReplay"));
+		statusLabel->setStyleSheet(QStringLiteral("color: #FF9800;")); // Orange/Amber
+		toggleBtn->setText(QTStr("Basic.DynamicDelay.Disable"));
 	}
 
 	progressBar->setMaximum(target_sec * 1000);

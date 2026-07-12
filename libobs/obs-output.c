@@ -249,6 +249,7 @@ obs_output_t *obs_output_create(const char *id, const char *name, obs_data_t *se
 	output->reconnect_retry_exp = RECONNECT_RETRY_BASE_EXP + (rand_float(0) * 0.05f);
 	output->valid = true;
 	output->dynamic_delay_target_sec = 180;
+	output->dynamic_delay_mode = 0;
 	output->dynamic_delay_state = 0;
 
 	obs_context_init_control(&output->context, output, (obs_destroy_cb)obs_output_destroy);
@@ -1934,6 +1935,20 @@ static inline void send_interleaved(struct obs_output *output)
 				output->dynamic_delay_media = NULL;
 				output->dynamic_delay_state = 0; // Back to LIVE
 				blog(LOG_INFO, "Dynamic Delay: Buffer cleared. Returned to LIVE state.");
+			} else if (output->dynamic_delay_state == 4) { // ACCUMULATING_REPLAY
+				if (output->dynamic_delay_wait_keyframe && out.type == OBS_ENCODER_VIDEO &&
+				    out.keyframe)
+					output->dynamic_delay_wait_keyframe = false;
+				if (!output->dynamic_delay_wait_keyframe)
+					dynamic_delay_push(output->dynamic_delay_buf, &out);
+				/* In replay mode, send_live stays true so the audience watches live in real-time
+				 * while the buffer accumulates. Once target reached, switch to DELAYED to replay from start. */
+				if (dynamic_delay_buffered_ms(output->dynamic_delay_buf) >=
+				    (uint64_t)output->dynamic_delay_target_sec * 1000ULL) {
+					output->dynamic_delay_state = 2; // DELAYED
+					blog(LOG_INFO,
+					     "Dynamic Delay (Replay Mode): Target delay reached! Transitioning to DELAYED state (replaying from buffer start).");
+				}
 			}
 		}
 		if (send_live)
@@ -3602,6 +3617,20 @@ const char *obs_output_get_dynamic_delay_waiting_media(const obs_output_t *outpu
 	return output ? output->dynamic_delay_waiting_media : NULL;
 }
 
+void obs_output_set_dynamic_delay_mode(obs_output_t *output, int mode)
+{
+	if (!output)
+		return;
+	pthread_mutex_lock(&output->dynamic_delay_mutex);
+	output->dynamic_delay_mode = mode;
+	pthread_mutex_unlock(&output->dynamic_delay_mutex);
+}
+
+int obs_output_get_dynamic_delay_mode(const obs_output_t *output)
+{
+	return output ? output->dynamic_delay_mode : 0;
+}
+
 int obs_output_get_dynamic_delay_state(const obs_output_t *output)
 {
 	return output ? output->dynamic_delay_state : 0;
@@ -3623,7 +3652,7 @@ uint64_t obs_output_get_dynamic_delay_memory_bytes(const obs_output_t *output)
 
 void obs_output_dynamic_delay_toggle(obs_output_t *output)
 {
-	bool activate = false;
+	bool activate_media = false;
 
 	if (!output)
 		return;
@@ -3631,11 +3660,16 @@ void obs_output_dynamic_delay_toggle(obs_output_t *output)
 	pthread_mutex_lock(&output->dynamic_delay_mutex);
 	if (!output->dynamic_delay_enabled || output->dynamic_delay_state == 0) {
 		output->dynamic_delay_enabled = true;
-		output->dynamic_delay_state = 1; // ACCUMULATING
+		if (output->dynamic_delay_mode == 1) {
+			output->dynamic_delay_state = 4; // ACCUMULATING_REPLAY
+			blog(LOG_INFO, "Dynamic Delay activated: ACCUMULATING_REPLAY (Streaming live, will replay from start)");
+		} else {
+			output->dynamic_delay_state = 1; // ACCUMULATING
+			blog(LOG_INFO, "Dynamic Delay activated: ACCUMULATING");
+			activate_media = true;
+		}
 		output->dynamic_delay_wait_keyframe = true;
 		dyn_delay_reset_offsets(output);
-		activate = true;
-		blog(LOG_INFO, "Dynamic Delay activated: ACCUMULATING");
 	} else {
 		output->dynamic_delay_state = 3; // CATCHUP
 		blog(LOG_INFO, "Dynamic Delay deactivated: CATCHUP / DROP");
@@ -3646,7 +3680,7 @@ void obs_output_dynamic_delay_toggle(obs_output_t *output)
 	}
 	pthread_mutex_unlock(&output->dynamic_delay_mutex);
 
-	if (!activate)
+	if (!activate_media)
 		return;
 
 	/* start the waiting media pipeline; created outside the mutex because
