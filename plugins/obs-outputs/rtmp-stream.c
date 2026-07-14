@@ -100,6 +100,8 @@ static inline bool disconnected(struct rtmp_stream *stream)
 	return os_atomic_load_bool(&stream->disconnected);
 }
 
+static void free_sink_resources(struct rtmp_sink *sink);
+
 static void rtmp_stream_destroy(void *data)
 {
 	struct rtmp_stream *stream = data;
@@ -146,21 +148,38 @@ static void rtmp_stream_destroy(void *data)
 	os_event_destroy(stream->send_thread_signaled_exit);
 	pthread_mutex_destroy(&stream->write_buf_mutex);
 
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		free_sink_resources(stream->sinks.array[i]);
+	}
+	da_free(stream->sinks);
+	pthread_mutex_unlock(&stream->sinks_mutex);
+	pthread_mutex_destroy(&stream->sinks_mutex);
+
 	if (stream->write_buf)
 		bfree(stream->write_buf);
 	bfree(stream);
 }
+
+static void add_sink_proc(void *data, calldata_t *cd);
+static void remove_sink_proc(void *data, calldata_t *cd);
+static void clear_sinks_proc(void *data, calldata_t *cd);
+static void get_sinks_count_proc(void *data, calldata_t *cd);
+static void get_sink_status_proc(void *data, calldata_t *cd);
 
 static void *rtmp_stream_create(obs_data_t *settings, obs_output_t *output)
 {
 	struct rtmp_stream *stream = bzalloc(sizeof(struct rtmp_stream));
 	stream->output = output;
 	pthread_mutex_init_value(&stream->packets_mutex);
+	pthread_mutex_init_value(&stream->sinks_mutex);
 
 	RTMP_LogSetCallback(log_rtmp);
 	RTMP_LogSetLevel(RTMP_LOGWARNING);
 
 	if (pthread_mutex_init(&stream->packets_mutex, NULL) != 0)
+		goto fail;
+	if (pthread_mutex_init(&stream->sinks_mutex, NULL) != 0)
 		goto fail;
 	if (os_event_init(&stream->stop_event, OS_EVENT_TYPE_MANUAL) != 0)
 		goto fail;
@@ -192,6 +211,15 @@ static void *rtmp_stream_create(obs_data_t *settings, obs_output_t *output)
 		goto fail;
 	}
 
+	proc_handler_t *ph = obs_output_get_proc_handler(output);
+	proc_handler_add(ph, "void add_sink(in ptr service, out ptr sink)", add_sink_proc, stream);
+	proc_handler_add(ph, "void remove_sink(in ptr sink)", remove_sink_proc, stream);
+	proc_handler_add(ph, "void clear_sinks()", clear_sinks_proc, stream);
+	proc_handler_add(ph, "void get_sinks_count(out int count)", get_sinks_count_proc, stream);
+	proc_handler_add(ph,
+			 "void get_sink_status(in int index, out string name, out bool active, out bool disconnected, out bool connecting, out bool reconnecting)",
+			 get_sink_status_proc, stream);
+
 	UNUSED_PARAMETER(settings);
 	return stream;
 
@@ -206,6 +234,12 @@ static void rtmp_stream_stop(void *data, uint64_t ts)
 
 	if (stopping(stream) && ts != 0)
 		return;
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		rtmp_sink_stop(stream->sinks.array[i]);
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
 
 	if (connecting(stream))
 		pthread_join(stream->connect_thread, NULL);
@@ -1547,6 +1581,13 @@ static bool rtmp_stream_start(void *data)
 		return false;
 
 	os_atomic_set_bool(&stream->connecting, true);
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		rtmp_sink_start(stream->sinks.array[i]);
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
+
 	return pthread_create(&stream->connect_thread, NULL, connect_thread, stream) == 0;
 }
 
@@ -1835,6 +1876,593 @@ static bool add_video_packet(struct rtmp_stream *stream, struct encoder_packet *
 	return add_packet(stream, packet);
 }
 
+static inline size_t sink_num_buffered_packets(struct rtmp_sink *sink)
+{
+	return sink->packets.size / sizeof(struct encoder_packet);
+}
+
+static inline void sink_free_packets(struct rtmp_sink *sink)
+{
+	pthread_mutex_lock(&sink->packets_mutex);
+	while (sink->packets.size) {
+		struct encoder_packet packet;
+		deque_pop_front(&sink->packets, &packet, sizeof(packet));
+		obs_encoder_packet_release(&packet);
+	}
+	pthread_mutex_unlock(&sink->packets_mutex);
+}
+
+static int sink_send_packet(struct rtmp_sink *sink, struct encoder_packet *packet, bool is_header)
+{
+	uint8_t *data;
+	size_t size;
+	int ret = 0;
+
+	flv_packet_mux(packet, is_header ? 0 : sink->start_dts_offset, &data, &size, is_header);
+
+	ret = RTMP_Write(&sink->rtmp, (char *)data, (int)size, 0);
+	bfree(data);
+
+	if (is_header)
+		bfree(packet->data);
+	else
+		obs_encoder_packet_release(packet);
+
+	sink->total_bytes_sent += size;
+	return ret;
+}
+
+static int sink_send_packet_ex(struct rtmp_sink *sink, struct encoder_packet *packet, bool is_header, bool is_footer,
+			       size_t idx)
+{
+	struct rtmp_stream *stream = sink->parent;
+	uint8_t *data;
+	size_t size = 0;
+	int ret = 0;
+
+	if (is_header) {
+		flv_packet_start(packet, stream->video_codec[idx], &data, &size, idx);
+	} else if (is_footer) {
+		flv_packet_end(packet, stream->video_codec[idx], &data, &size, idx);
+	} else {
+		flv_packet_frames(packet, stream->video_codec[idx], sink->start_dts_offset, &data, &size, idx);
+	}
+
+	ret = RTMP_Write(&sink->rtmp, (char *)data, (int)size, 0);
+	bfree(data);
+
+	if (is_header || is_footer)
+		bfree(packet->data);
+	else
+		obs_encoder_packet_release(packet);
+
+	sink->total_bytes_sent += size;
+	return ret;
+}
+
+static int sink_send_audio_packet_ex(struct rtmp_sink *sink, struct encoder_packet *packet, bool is_header, size_t idx)
+{
+	struct rtmp_stream *stream = sink->parent;
+	uint8_t *data;
+	size_t size = 0;
+	int ret = 0;
+
+	if (is_header) {
+		flv_packet_audio_start(packet, stream->audio_codec[idx], &data, &size, idx);
+	} else {
+		flv_packet_audio_frames(packet, stream->audio_codec[idx], sink->start_dts_offset, &data, &size, idx);
+	}
+
+	ret = RTMP_Write(&sink->rtmp, (char *)data, (int)size, 0);
+	bfree(data);
+
+	if (is_header)
+		bfree(packet->data);
+	else
+		obs_encoder_packet_release(packet);
+
+	sink->total_bytes_sent += size;
+	return ret;
+}
+
+static bool sink_send_audio_header(struct rtmp_sink *sink, size_t idx)
+{
+	obs_output_t *context = sink->parent->output;
+	obs_encoder_t *aencoder = obs_output_get_audio_encoder(context, idx);
+	uint8_t *header;
+
+	struct encoder_packet packet = {.type = OBS_ENCODER_AUDIO, .timebase_den = 1};
+
+	if (!aencoder) {
+		return true;
+	}
+
+	if (obs_encoder_get_extra_data(aencoder, &header, &packet.size)) {
+		packet.data = bmemdup(header, packet.size);
+		if (idx == 0) {
+			return sink_send_packet(sink, &packet, true) >= 0;
+		} else {
+			return sink_send_audio_packet_ex(sink, &packet, true, idx) >= 0;
+		}
+	}
+	return false;
+}
+
+static bool sink_send_video_header(struct rtmp_sink *sink, size_t idx)
+{
+	struct rtmp_stream *stream = sink->parent;
+	obs_output_t *context = stream->output;
+	obs_encoder_t *vencoder = obs_output_get_video_encoder2(context, idx);
+	uint8_t *header;
+	size_t size;
+
+	struct encoder_packet packet = {.type = OBS_ENCODER_VIDEO, .timebase_den = 1, .keyframe = true};
+
+	if (!vencoder)
+		return false;
+
+	if (!obs_encoder_get_extra_data(vencoder, &header, &size))
+		return false;
+
+	switch (stream->video_codec[idx]) {
+	case CODEC_NONE:
+		do_log(LOG_ERROR, "Codec not initialized for track %zu while sending sink header", idx);
+		return false;
+
+	case CODEC_H264:
+		packet.size = obs_parse_avc_header(&packet.data, header, size);
+		if (idx == 0) {
+			return sink_send_packet(sink, &packet, true) >= 0;
+		} else {
+			return sink_send_packet_ex(sink, &packet, true, false, idx) >= 0;
+		}
+	case CODEC_HEVC:
+#ifdef ENABLE_HEVC
+		packet.size = obs_parse_hevc_header(&packet.data, header, size);
+		return sink_send_packet_ex(sink, &packet, true, false, idx) >= 0;
+#else
+		return false;
+#endif
+	case CODEC_AV1:
+		packet.size = obs_parse_av1_header(&packet.data, header, size);
+		return sink_send_packet_ex(sink, &packet, true, false, idx) >= 0;
+	}
+
+	return false;
+}
+
+static bool sink_send_video_metadata(struct rtmp_sink *sink, size_t idx)
+{
+	struct rtmp_stream *stream = sink->parent;
+	obs_encoder_t *encoder = obs_output_get_video_encoder2(stream->output, idx);
+	if (!encoder)
+		return false;
+
+	video_t *video = obs_encoder_video(encoder);
+	if (!video)
+		return false;
+
+	const struct video_output_info *info = video_output_get_info(video);
+	enum video_colorspace colorspace = info->colorspace;
+	if (!(colorspace == VIDEO_CS_2100_PQ || colorspace == VIDEO_CS_2100_HLG))
+		return true;
+
+	if (stream->video_codec[idx] != CODEC_H264) {
+		uint8_t *data;
+		size_t size;
+
+		video = obs_get_video();
+		const struct video_output_info *info = video_output_get_info(video);
+		enum video_format format = info->format;
+		enum video_colorspace colorspace = info->colorspace;
+
+		int bits_per_raw_sample;
+		switch (format) {
+		case VIDEO_FORMAT_I010:
+		case VIDEO_FORMAT_P010:
+		case VIDEO_FORMAT_I210:
+			bits_per_raw_sample = 10;
+			break;
+		case VIDEO_FORMAT_I412:
+		case VIDEO_FORMAT_YA2L:
+			bits_per_raw_sample = 12;
+			break;
+		default:
+			bits_per_raw_sample = 8;
+		}
+
+		int pri = 0, trc = 0, spc = 0;
+		switch (colorspace) {
+		case VIDEO_CS_601:
+			pri = OBSCOL_PRI_SMPTE170M;
+			trc = OBSCOL_PRI_SMPTE170M;
+			spc = OBSCOL_PRI_SMPTE170M;
+			break;
+		case VIDEO_CS_DEFAULT:
+		case VIDEO_CS_709:
+			pri = OBSCOL_PRI_BT709;
+			trc = OBSCOL_PRI_BT709;
+			spc = OBSCOL_PRI_BT709;
+			break;
+		case VIDEO_CS_SRGB:
+			pri = OBSCOL_PRI_BT709;
+			trc = OBSCOL_TRC_IEC61966_2_1;
+			spc = OBSCOL_PRI_BT709;
+			break;
+		case VIDEO_CS_2100_PQ:
+			pri = OBSCOL_PRI_BT2020;
+			trc = OBSCOL_TRC_SMPTE2084;
+			spc = OBSCOL_SPC_BT2020_NCL;
+			break;
+		case VIDEO_CS_2100_HLG:
+			pri = OBSCOL_PRI_BT2020;
+			trc = OBSCOL_TRC_ARIB_STD_B67;
+			spc = OBSCOL_SPC_BT2020_NCL;
+		}
+
+		int max_luminance = 0;
+		if (trc == OBSCOL_TRC_ARIB_STD_B67)
+			max_luminance = 1000;
+		else if (trc == OBSCOL_TRC_SMPTE2084)
+			max_luminance = (int)obs_get_video_hdr_nominal_peak_level();
+
+		flv_packet_metadata(stream->video_codec[idx], &data, &size, bits_per_raw_sample, pri, trc, spc, 0,
+				    max_luminance, idx);
+
+		int ret = RTMP_Write(&sink->rtmp, (char *)data, (int)size, 0);
+		bfree(data);
+
+		sink->total_bytes_sent += size;
+		return ret >= 0;
+	}
+	return true;
+}
+
+static bool sink_send_headers(struct rtmp_sink *sink)
+{
+	sink->sent_headers = true;
+
+	for (size_t i = 0; i < MAX_OUTPUT_AUDIO_ENCODERS; i++) {
+		obs_encoder_t *enc = obs_output_get_audio_encoder(sink->parent->output, i);
+		if (!enc)
+			continue;
+
+		if (!sink_send_audio_header(sink, i))
+			return false;
+	}
+
+	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
+		obs_encoder_t *enc = obs_output_get_video_encoder2(sink->parent->output, i);
+		if (!enc)
+			continue;
+
+		if (!sink_send_video_metadata(sink, i) || !sink_send_video_header(sink, i))
+			return false;
+	}
+
+	return true;
+}
+
+static void *sink_send_thread(void *data)
+{
+	struct rtmp_sink *sink = data;
+	struct rtmp_stream *stream = sink->parent;
+	os_set_thread_name("rtmp-stream: sink_send_thread");
+
+	while (os_sem_wait(sink->send_sem) == 0) {
+		struct encoder_packet packet;
+
+		if (os_event_try(sink->stop_event) != EAGAIN && sink->stop_ts == 0)
+			break;
+
+		pthread_mutex_lock(&sink->packets_mutex);
+		if (!sink->packets.size) {
+			pthread_mutex_unlock(&sink->packets_mutex);
+			continue;
+		}
+		deque_pop_front(&sink->packets, &packet, sizeof(packet));
+		pthread_mutex_unlock(&sink->packets_mutex);
+
+		if (os_event_try(sink->stop_event) != EAGAIN) {
+			obs_encoder_packet_release(&packet);
+			continue;
+		}
+
+		if (!sink->sent_headers) {
+			if (!sink_send_headers(sink)) {
+				obs_encoder_packet_release(&packet);
+				os_atomic_set_bool(&sink->disconnected, true);
+				sink->reconnecting = true;
+				break;
+			}
+		}
+
+		int sent;
+		if (packet.type == OBS_ENCODER_VIDEO &&
+		    (stream->video_codec[packet.track_idx] != CODEC_H264 ||
+		     (stream->video_codec[packet.track_idx] == CODEC_H264 && packet.track_idx != 0))) {
+			sent = sink_send_packet_ex(sink, &packet, false, false, packet.track_idx);
+		} else if (packet.type == OBS_ENCODER_AUDIO && packet.track_idx != 0) {
+			sent = sink_send_audio_packet_ex(sink, &packet, false, packet.track_idx);
+		} else {
+			sent = sink_send_packet(sink, &packet, false);
+		}
+
+		if (sent < 0) {
+			os_atomic_set_bool(&sink->disconnected, true);
+			sink->reconnecting = true;
+			break;
+		}
+	}
+
+	if (os_atomic_load_bool(&sink->disconnected)) {
+		info("Disconnected sink %s", sink->name ? sink->name : sink->path.array);
+	}
+
+	return NULL;
+}
+
+static void *sink_connect_thread(void *data)
+{
+	struct rtmp_sink *sink = data;
+	struct rtmp_stream *stream = sink->parent;
+	os_set_thread_name("rtmp-stream: sink_connect_thread");
+
+	sink_free_packets(sink);
+	os_atomic_set_bool(&sink->disconnected, false);
+	os_atomic_set_bool(&sink->encode_error, false);
+	sink->sent_headers = false;
+	/* total_bytes_sent is intentionally not reset here: it accumulates
+	 * across sink reconnects and feeds the output's total_bytes_sent
+	 * sum, which the frontend expects to be monotonic */
+	sink->dropped_frames = 0;
+	sink->reconnect_time_ns = 0;
+	sink->got_first_packet = false;
+
+	if (!sink->service) {
+		os_atomic_set_bool(&sink->connecting, false);
+		return NULL;
+	}
+
+	dstr_copy(&sink->path, obs_service_get_connect_info(sink->service, OBS_SERVICE_CONNECT_INFO_SERVER_URL));
+	dstr_copy(&sink->key, obs_service_get_connect_info(sink->service, OBS_SERVICE_CONNECT_INFO_STREAM_KEY));
+	dstr_copy(&sink->username, obs_service_get_connect_info(sink->service, OBS_SERVICE_CONNECT_INFO_USERNAME));
+	dstr_copy(&sink->password, obs_service_get_connect_info(sink->service, OBS_SERVICE_CONNECT_INFO_PASSWORD));
+	dstr_depad(&sink->path);
+	dstr_depad(&sink->key);
+
+	if (dstr_is_empty(&sink->path)) {
+		os_atomic_set_bool(&sink->connecting, false);
+		return NULL;
+	}
+
+	RTMP_Init(&sink->rtmp);
+	if (!RTMP_SetupURL(&sink->rtmp, sink->path.array)) {
+		os_atomic_set_bool(&sink->connecting, false);
+		return NULL;
+	}
+
+	dstr_copy(&sink->encoder_name, "FMLE/3.0 (compatible; FMSc/1.0)");
+	set_rtmp_dstr(&sink->rtmp.Link.pubUser, &sink->username);
+	set_rtmp_dstr(&sink->rtmp.Link.pubPasswd, &sink->password);
+	set_rtmp_dstr(&sink->rtmp.Link.flashVer, &sink->encoder_name);
+	sink->rtmp.Link.swfUrl = sink->rtmp.Link.tcUrl;
+	RTMP_EnableWrite(&sink->rtmp);
+
+	if (dstr_is_empty(&sink->bind_ip) && !dstr_is_empty(&stream->bind_ip)) {
+		dstr_copy(&sink->bind_ip, stream->bind_ip.array);
+	}
+	if (dstr_is_empty(&sink->bind_ip) || dstr_cmp(&sink->bind_ip, "default") == 0) {
+		memset(&sink->rtmp.m_bindIP, 0, sizeof(sink->rtmp.m_bindIP));
+	} else {
+		netif_str_to_addr(&sink->rtmp.m_bindIP.addr, &sink->rtmp.m_bindIP.addrLen,
+				  sink->bind_ip.array);
+	}
+	if (sink->rtmp.m_bindIP.addrLen == 0)
+		sink->rtmp.m_bindIP.addrLen = stream->addrlen_hint;
+
+	RTMP_AddStream(&sink->rtmp, sink->key.array);
+
+	sink->rtmp.m_outChunkSize = 4096;
+	sink->rtmp.m_bSendChunkSizeInfo = true;
+	sink->rtmp.m_bUseNagle = true;
+
+	if (!RTMP_Connect(&sink->rtmp, NULL) || !RTMP_ConnectStream(&sink->rtmp, 0)) {
+		os_atomic_set_bool(&sink->connecting, false);
+		os_atomic_set_bool(&sink->disconnected, true);
+		sink->reconnecting = true;
+		return NULL;
+	}
+
+	sink->wait_for_keyframe = true;
+
+	if (pthread_create(&sink->send_thread, NULL, sink_send_thread, sink) != 0) {
+		RTMP_Close(&sink->rtmp);
+		os_atomic_set_bool(&sink->disconnected, true);
+		sink->reconnecting = true;
+		os_atomic_set_bool(&sink->connecting, false);
+		return NULL;
+	}
+
+	os_atomic_set_bool(&sink->active, true);
+	os_atomic_set_bool(&sink->connecting, false);
+	return NULL;
+}
+
+bool rtmp_sink_start(struct rtmp_sink *sink)
+{
+	if (!sink || os_atomic_load_bool(&sink->active) || os_atomic_load_bool(&sink->connecting))
+		return false;
+	/* stop_event is manual-reset; clear leftover signal from a previous
+	 * stop or the send thread exits immediately */
+	os_event_reset(sink->stop_event);
+	os_atomic_set_bool(&sink->connecting, true);
+	if (pthread_create(&sink->connect_thread, NULL, sink_connect_thread, sink) != 0) {
+		os_atomic_set_bool(&sink->connecting, false);
+		return false;
+	}
+	sink->connect_thread_valid = true;
+	return true;
+}
+
+void rtmp_sink_stop(struct rtmp_sink *sink)
+{
+	if (!sink)
+		return;
+	if (sink->connect_thread_valid) {
+		pthread_join(sink->connect_thread, NULL);
+		sink->connect_thread_valid = false;
+	}
+	if (os_atomic_load_bool(&sink->active)) {
+		os_event_signal(sink->stop_event);
+		os_sem_post(sink->send_sem);
+		pthread_join(sink->send_thread, NULL);
+		os_atomic_set_bool(&sink->active, false);
+	}
+	RTMP_Close(&sink->rtmp);
+	sink_free_packets(sink);
+}
+
+static void free_sink_resources(struct rtmp_sink *sink)
+{
+	if (!sink)
+		return;
+	rtmp_sink_stop(sink);
+	os_event_destroy(sink->stop_event);
+	os_sem_destroy(sink->send_sem);
+	pthread_mutex_destroy(&sink->packets_mutex);
+	deque_free(&sink->packets);
+	dstr_free(&sink->path);
+	dstr_free(&sink->key);
+	dstr_free(&sink->username);
+	dstr_free(&sink->password);
+	dstr_free(&sink->encoder_name);
+	dstr_free(&sink->bind_ip);
+	obs_service_release(sink->service);
+	if (sink->name)
+		bfree(sink->name);
+	bfree(sink);
+}
+
+struct rtmp_sink *rtmp_stream_add_sink(struct rtmp_stream *stream, obs_service_t *service)
+{
+	if (!stream || !service)
+		return NULL;
+
+	/* hold a reference so the frontend can release/replace its own list
+	 * while the sink is still streaming */
+	service = obs_service_get_ref(service);
+	if (!service)
+		return NULL;
+
+	struct rtmp_sink *sink = bzalloc(sizeof(struct rtmp_sink));
+	sink->parent = stream;
+	sink->service = service;
+	RTMP_Init(&sink->rtmp);
+	pthread_mutex_init_value(&sink->packets_mutex);
+	pthread_mutex_init(&sink->packets_mutex, NULL);
+	os_event_init(&sink->stop_event, OS_EVENT_TYPE_MANUAL);
+	os_sem_init(&sink->send_sem, 0);
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	da_push_back(stream->sinks, &sink);
+	if (active(stream) || connecting(stream)) {
+		rtmp_sink_start(sink);
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
+	return sink;
+}
+
+void rtmp_stream_remove_sink(struct rtmp_stream *stream, struct rtmp_sink *sink)
+{
+	if (!stream || !sink)
+		return;
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		if (stream->sinks.array[i] == sink) {
+			da_erase(stream->sinks, i);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
+
+	free_sink_resources(sink);
+}
+
+/* sink equivalents of drop_frames/find_first_video_packet/check_to_drop_frames;
+ * called with sink->packets_mutex held */
+static void sink_drop_frames(struct rtmp_sink *sink, int highest_priority)
+{
+	struct deque new_buf = {0};
+	int num_frames_dropped = 0;
+
+	deque_reserve(&new_buf, sizeof(struct encoder_packet) * 8);
+
+	while (sink->packets.size) {
+		struct encoder_packet packet;
+		deque_pop_front(&sink->packets, &packet, sizeof(packet));
+
+		/* do not drop audio data or video keyframes */
+		if (packet.type == OBS_ENCODER_AUDIO || packet.drop_priority >= highest_priority) {
+			deque_push_back(&new_buf, &packet, sizeof(packet));
+
+		} else {
+			num_frames_dropped++;
+			obs_encoder_packet_release(&packet);
+		}
+	}
+
+	deque_free(&sink->packets);
+	sink->packets = new_buf;
+
+	if (sink->min_priority < highest_priority)
+		sink->min_priority = highest_priority;
+
+	sink->dropped_frames += num_frames_dropped;
+}
+
+static bool sink_find_first_video_packet(struct rtmp_sink *sink, struct encoder_packet *first)
+{
+	size_t count = sink->packets.size / sizeof(*first);
+
+	for (size_t i = 0; i < count; i++) {
+		struct encoder_packet *cur = deque_data(&sink->packets, i * sizeof(*first));
+		if (cur->type == OBS_ENCODER_VIDEO && !cur->keyframe) {
+			*first = *cur;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void sink_check_to_drop_frames(struct rtmp_sink *sink, bool pframes)
+{
+	struct encoder_packet first;
+	int64_t buffer_duration_usec;
+	int priority = pframes ? OBS_NAL_PRIORITY_HIGHEST : OBS_NAL_PRIORITY_HIGH;
+	int64_t drop_threshold = pframes ? sink->parent->pframe_drop_threshold_usec
+					 : sink->parent->drop_threshold_usec;
+
+	if (sink_num_buffered_packets(sink) < 5) {
+		if (!pframes)
+			sink->congestion = 0.0f;
+		return;
+	}
+
+	if (!sink_find_first_video_packet(sink, &first))
+		return;
+
+	buffer_duration_usec = sink->last_dts_usec - first.dts_usec;
+
+	if (!pframes)
+		sink->congestion = (float)buffer_duration_usec / (float)drop_threshold;
+
+	if (buffer_duration_usec > drop_threshold)
+		sink_drop_frames(sink, priority);
+}
+
 static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 {
 	struct rtmp_stream *stream = data;
@@ -1893,6 +2521,72 @@ static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 	}
 
 	pthread_mutex_unlock(&stream->packets_mutex);
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		struct rtmp_sink *sink = stream->sinks.array[i];
+		if (os_atomic_load_bool(&sink->disconnected) || !os_atomic_load_bool(&sink->active)) {
+			if (sink->reconnecting && !os_atomic_load_bool(&sink->connecting)) {
+				uint64_t now = os_gettime_ns();
+				if (sink->reconnect_time_ns == 0) {
+					sink->reconnect_time_ns = now + 3000000000ULL;
+				} else if (now >= sink->reconnect_time_ns) {
+					sink->reconnect_time_ns = 0;
+					sink->reconnecting = false;
+					/* reap the dead send thread and close the
+					 * old connection, otherwise active stays
+					 * set and start refuses */
+					rtmp_sink_stop(sink);
+					rtmp_sink_start(sink);
+				}
+			}
+			continue;
+		}
+
+		if (sink->wait_for_keyframe) {
+			if (packet->type != OBS_ENCODER_VIDEO || !packet->keyframe)
+				continue;
+			sink->wait_for_keyframe = false;
+		}
+
+		/* rebase FLV timestamps to this sink's own connection start */
+		if (!sink->got_first_packet) {
+			sink->start_dts_offset = get_ms_time(packet, packet->dts);
+			sink->got_first_packet = true;
+		}
+
+		struct encoder_packet sink_packet;
+		obs_encoder_packet_ref(&sink_packet, &new_packet);
+
+		pthread_mutex_lock(&sink->packets_mutex);
+		bool sink_added = false;
+		if (!os_atomic_load_bool(&sink->disconnected)) {
+			if (sink_packet.type != OBS_ENCODER_VIDEO) {
+				deque_push_back(&sink->packets, &sink_packet, sizeof(struct encoder_packet));
+				sink_added = true;
+			} else {
+				sink_check_to_drop_frames(sink, false);
+				sink_check_to_drop_frames(sink, true);
+
+				if (sink_packet.drop_priority < sink->min_priority) {
+					sink->dropped_frames++;
+				} else {
+					sink->min_priority = 0;
+					sink->last_dts_usec = sink_packet.dts_usec;
+					deque_push_back(&sink->packets, &sink_packet,
+							sizeof(struct encoder_packet));
+					sink_added = true;
+				}
+			}
+		}
+		pthread_mutex_unlock(&sink->packets_mutex);
+
+		if (sink_added)
+			os_sem_post(sink->send_sem);
+		else
+			obs_encoder_packet_release(&sink_packet);
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
 
 	if (added_packet)
 		os_sem_post(stream->send_sem);
@@ -1954,7 +2648,14 @@ static obs_properties_t *rtmp_stream_properties(void *unused)
 static uint64_t rtmp_stream_total_bytes_sent(void *data)
 {
 	struct rtmp_stream *stream = data;
-	return stream->total_bytes_sent;
+	uint64_t total = stream->total_bytes_sent;
+
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++)
+		total += stream->sinks.array[i]->total_bytes_sent;
+	pthread_mutex_unlock(&stream->sinks_mutex);
+
+	return total;
 }
 
 static int rtmp_stream_dropped_frames(void *data)
@@ -1977,6 +2678,62 @@ static int rtmp_stream_connect_time(void *data)
 {
 	struct rtmp_stream *stream = data;
 	return stream->rtmp.connect_time_ms;
+}
+
+static void add_sink_proc(void *data, calldata_t *cd)
+{
+	struct rtmp_stream *stream = data;
+	obs_service_t *service = (obs_service_t *)calldata_ptr(cd, "service");
+	struct rtmp_sink *sink = rtmp_stream_add_sink(stream, service);
+	calldata_set_ptr(cd, "sink", sink);
+}
+
+static void remove_sink_proc(void *data, calldata_t *cd)
+{
+	struct rtmp_stream *stream = data;
+	struct rtmp_sink *sink = (struct rtmp_sink *)calldata_ptr(cd, "sink");
+	rtmp_stream_remove_sink(stream, sink);
+}
+
+static void clear_sinks_proc(void *data, calldata_t *cd)
+{
+	struct rtmp_stream *stream = data;
+	UNUSED_PARAMETER(cd);
+	pthread_mutex_lock(&stream->sinks_mutex);
+	for (size_t i = 0; i < stream->sinks.num; i++) {
+		free_sink_resources(stream->sinks.array[i]);
+	}
+	da_free(stream->sinks);
+	pthread_mutex_unlock(&stream->sinks_mutex);
+}
+
+static void get_sinks_count_proc(void *data, calldata_t *cd)
+{
+	struct rtmp_stream *stream = data;
+	pthread_mutex_lock(&stream->sinks_mutex);
+	calldata_set_int(cd, "count", (long long)stream->sinks.num);
+	pthread_mutex_unlock(&stream->sinks_mutex);
+}
+
+static void get_sink_status_proc(void *data, calldata_t *cd)
+{
+	struct rtmp_stream *stream = data;
+	size_t idx = (size_t)calldata_int(cd, "index");
+	pthread_mutex_lock(&stream->sinks_mutex);
+	if (idx < stream->sinks.num) {
+		struct rtmp_sink *sink = stream->sinks.array[idx];
+		obs_data_t *service_settings = sink->service ? obs_service_get_settings(sink->service) : NULL;
+		const char *name = service_settings ? obs_data_get_string(service_settings, "service") : NULL;
+		if (!name || !*name)
+			name = "Custom";
+		calldata_set_string(cd, "name", name);
+		obs_data_release(service_settings);
+		calldata_set_bool(cd, "active", os_atomic_load_bool(&sink->active));
+		calldata_set_bool(cd, "disconnected", os_atomic_load_bool(&sink->disconnected));
+		calldata_set_bool(cd, "connecting", os_atomic_load_bool(&sink->connecting));
+		calldata_set_bool(cd, "reconnecting", sink->reconnecting);
+	}
+	pthread_mutex_unlock(&stream->sinks_mutex);
 }
 
 struct obs_output_info rtmp_output_info = {

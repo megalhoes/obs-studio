@@ -90,6 +90,7 @@ private slots:
 	void UpdateStatusBar();
 	void UpdateCurrentFPS();
 	void UpdateIcons();
+	void UpdateSinksIcons();
 
 public:
 	OBSBasicStatusBar(QWidget *parent);

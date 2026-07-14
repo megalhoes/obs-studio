@@ -1539,7 +1539,7 @@
               <item>
                <widget class="QGroupBox" name="destinationGroupBox">
                 <property name="title">
-                 <string>Basic.Settings.Stream.Destination</string>
+                 <string>Basic.Settings.Stream.Destinations</string>
                 </property>
                 <layout class="QFormLayout" name="destinationLayout">
                  <property name="fieldGrowthPolicy">
@@ -1843,6 +1843,31 @@
                      </widget>
                     </item>
                    </layout>
+                  </widget>
+                 </item>
+                 <item row="9" column="0" colspan="2">
+                  <widget class="QWidget" name="extraDestinationsContainer">
+                   <layout class="QVBoxLayout" name="extraDestinationsLayout">
+                    <property name="leftMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="topMargin">
+                     <number>6</number>
+                    </property>
+                    <property name="rightMargin">
+                     <number>0</number>
+                    </property>
+                    <property name="bottomMargin">
+                     <number>6</number>
+                    </property>
+                   </layout>
+                  </widget>
+                 </item>
+                 <item row="10" column="1">
+                  <widget class="QPushButton" name="addDestinationButton">
+                   <property name="text">
+                    <string>Basic.Settings.Stream.AddDestination</string>
+                   </property>
                   </widget>
                  </item>
                 </layout>

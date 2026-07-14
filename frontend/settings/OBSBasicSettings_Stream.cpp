@@ -37,6 +37,260 @@ enum class Section : int {
 	StreamKey,
 };
 
+#include <QGroupBox>
+#include <QFormLayout>
+#include <QComboBox>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QStackedWidget>
+#include <components/UrlPushButton.hpp>
+
+class ExtraDestinationWidget : public QGroupBox {
+public:
+	QComboBox *serviceCombo = nullptr;
+	QComboBox *serverCombo = nullptr;
+	QLineEdit *customServerEdit = nullptr;
+	QLineEdit *keyEdit = nullptr;
+	QPushButton *showBtn = nullptr;
+	UrlPushButton *getKeyBtn = nullptr;
+	QPushButton *removeBtn = nullptr;
+	QStackedWidget *serverStacked = nullptr;
+	QString lastServiceName;
+
+	OBSBasicSettings *settings = nullptr;
+
+	ExtraDestinationWidget(OBSBasicSettings *settings_, obs_service_t *service = nullptr, QWidget *parent = nullptr)
+		: QGroupBox(parent), settings(settings_)
+	{
+		setTitle(QTStr("Basic.Settings.Stream.Destination"));
+		QFormLayout *layout = new QFormLayout(this);
+		layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+		serviceCombo = new QComboBox(this);
+		removeBtn = new QPushButton(QTStr("Remove"), this);
+		removeBtn->setCursor(Qt::PointingHandCursor);
+		QHBoxLayout *serviceLayout = new QHBoxLayout();
+		serviceLayout->setContentsMargins(0, 0, 0, 0);
+		serviceLayout->addWidget(serviceCombo);
+		serviceLayout->addWidget(removeBtn);
+		layout->addRow(QTStr("Basic.AutoConfig.StreamPage.Service"), serviceLayout);
+
+		LoadServiceList(false);
+
+		serverStacked = new QStackedWidget(this);
+		serverCombo = new QComboBox(this);
+		customServerEdit = new QLineEdit(this);
+		serverStacked->addWidget(serverCombo);
+		serverStacked->addWidget(customServerEdit);
+		layout->addRow(QTStr("Basic.AutoConfig.StreamPage.Server"), serverStacked);
+
+		keyEdit = new QLineEdit(this);
+		keyEdit->setEchoMode(QLineEdit::Password);
+		showBtn = new QPushButton(QTStr("Show"), this);
+		getKeyBtn = new UrlPushButton(this);
+		getKeyBtn->setText(QTStr("Basic.AutoConfig.StreamPage.GetStreamKey"));
+		QHBoxLayout *keyLayout = new QHBoxLayout();
+		keyLayout->setContentsMargins(0, 0, 0, 0);
+		keyLayout->addWidget(keyEdit);
+		keyLayout->addWidget(showBtn);
+		keyLayout->addWidget(getKeyBtn);
+		layout->addRow(QTStr("Basic.AutoConfig.StreamPage.StreamKey"), keyLayout);
+
+		connect(serviceCombo, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
+			[this](int) {
+				if (serviceCombo->currentData().toInt() == (int)ListOpt::ShowAll) {
+					LoadServiceList(true);
+					serviceCombo->showPopup();
+					return;
+				}
+				OnServiceChanged();
+			});
+		connect(showBtn, &QPushButton::clicked, this, [this](bool) { OnShowClicked(); });
+		connect(removeBtn, &QPushButton::clicked, this, [this](bool) {
+			auto &vec = settings->extraDestinationsWidgets;
+			vec.erase(std::remove(vec.begin(), vec.end(), this), vec.end());
+			settings->Stream1Changed();
+			deleteLater();
+		});
+
+		if (service) {
+			OBSDataAutoRelease sSettings = obs_service_get_settings(service);
+			const char *sService = obs_data_get_string(sSettings, "service");
+			const char *sServer = obs_data_get_string(sSettings, "server");
+			const char *sKey = obs_data_get_string(sSettings, "key");
+
+			int idx;
+			if (strcmp(obs_service_get_type(service), "rtmp_custom") == 0) {
+				idx = serviceCombo->findData((int)ListOpt::Custom);
+			} else {
+				idx = serviceCombo->findText(QT_UTF8(sService));
+				if (idx < 0 && sService && *sService) {
+					serviceCombo->insertItem(1, QT_UTF8(sService));
+					idx = 1;
+				}
+			}
+			if (idx >= 0) {
+				serviceCombo->setCurrentIndex(idx);
+			}
+			OnServiceChanged();
+
+			if (serverStacked->currentIndex() == 0) {
+				int sIdx = serverCombo->findText(QT_UTF8(sServer));
+				if (sIdx >= 0) serverCombo->setCurrentIndex(sIdx);
+			} else {
+				customServerEdit->setText(QT_UTF8(sServer));
+			}
+			if (sKey) keyEdit->setText(QT_UTF8(sKey));
+		} else {
+			OnServiceChanged();
+		}
+
+		settings->HookWidget(serviceCombo, &QComboBox::currentIndexChanged, &OBSBasicSettings::Stream1Changed);
+		settings->HookWidget(serverCombo, &QComboBox::currentIndexChanged, &OBSBasicSettings::Stream1Changed);
+		settings->HookWidget(customServerEdit, &QLineEdit::textChanged, &OBSBasicSettings::Stream1Changed);
+		settings->HookWidget(keyEdit, &QLineEdit::textChanged, &OBSBasicSettings::Stream1Changed);
+	}
+
+	void OnShowClicked()
+	{
+		if (keyEdit->echoMode() == QLineEdit::Password) {
+			keyEdit->setEchoMode(QLineEdit::Normal);
+			showBtn->setText(QTStr("Hide"));
+		} else {
+			keyEdit->setEchoMode(QLineEdit::Password);
+			showBtn->setText(QTStr("Show"));
+		}
+	}
+
+	void LoadServiceList(bool showAll)
+	{
+		QSignalBlocker blocker(serviceCombo);
+		serviceCombo->clear();
+
+		OBSProperties props = obs_get_service_properties("rtmp_common");
+		OBSDataAutoRelease propSettings = obs_data_create();
+		obs_data_set_bool(propSettings, "show_all", showAll);
+		obs_property_t *prop = obs_properties_get(props, "show_all");
+		obs_property_modified(prop, propSettings);
+
+		QStringList names;
+		obs_property_t *services = obs_properties_get(props, "service");
+		size_t count = obs_property_list_item_count(services);
+		for (size_t i = 0; i < count; i++) {
+			names.push_back(obs_property_list_item_string(services, i));
+		}
+		if (showAll) {
+			names.sort(Qt::CaseInsensitive);
+		}
+		for (QString &name : names) {
+			serviceCombo->addItem(name);
+		}
+
+		/* WHIP is intentionally left out: extra destinations are RTMP
+		 * sinks of the main output and cannot use other protocols */
+		if (!showAll) {
+			serviceCombo->addItem(QTStr("Basic.AutoConfig.StreamPage.Service.ShowAll"),
+					      QVariant((int)ListOpt::ShowAll));
+		}
+
+		serviceCombo->insertItem(0, QTStr("Basic.AutoConfig.StreamPage.Service.Custom"),
+					 QVariant((int)ListOpt::Custom));
+
+		if (!lastServiceName.isEmpty()) {
+			int idx = serviceCombo->findText(lastServiceName);
+			if (idx != -1) {
+				serviceCombo->setCurrentIndex(idx);
+			}
+		}
+	}
+
+	bool IsCustomSelected() const { return serviceCombo->currentData().toInt() == (int)ListOpt::Custom; }
+
+	void OnServiceChanged()
+	{
+		QString serviceName = serviceCombo->currentText();
+		bool custom = IsCustomSelected();
+
+		if (!custom) {
+			lastServiceName = serviceName;
+		}
+
+		serverCombo->clear();
+		if (custom) {
+			serverStacked->setCurrentIndex(1);
+			getKeyBtn->hide();
+		} else {
+			serverStacked->setCurrentIndex(0);
+			getKeyBtn->show();
+
+			obs_properties_t *props = obs_get_service_properties("rtmp_common");
+			if (props) {
+				obs_property_t *p = obs_properties_get(props, "service");
+				obs_property_t *s = obs_properties_get(props, "server");
+				if (p && s) {
+					OBSDataAutoRelease sData = obs_data_create();
+					obs_data_set_string(sData, "service", QT_TO_UTF8(serviceName));
+					obs_property_modified(p, sData);
+
+					size_t count = obs_property_list_item_count(s);
+					for (size_t i = 0; i < count; i++) {
+						const char *name = obs_property_list_item_name(s, i);
+						const char *val = obs_property_list_item_string(s, i);
+						serverCombo->addItem(QT_UTF8(name), QT_UTF8(val));
+					}
+				}
+				obs_properties_destroy(props);
+			}
+
+			OBSProperties props_link = obs_get_service_properties("rtmp_common");
+			if (props_link) {
+				obs_property_t *services = obs_properties_get(props_link, "service");
+				OBSDataAutoRelease tempSettings = obs_data_create();
+				obs_data_set_string(tempSettings, "service", QT_TO_UTF8(serviceName));
+				obs_property_modified(services, tempSettings);
+
+				const char *url = obs_data_get_string(tempSettings, "stream_key_link");
+				if (url && *url) {
+					getKeyBtn->setTargetUrl(QUrl(QT_UTF8(url)));
+					getKeyBtn->show();
+				} else {
+					getKeyBtn->hide();
+				}
+			} else {
+				getKeyBtn->hide();
+			}
+		}
+	}
+
+	obs_service_t *CreateService()
+	{
+		QString serviceName = serviceCombo->currentText();
+		bool custom = IsCustomSelected();
+
+		OBSDataAutoRelease settings_data = obs_data_create();
+		if (custom) {
+			obs_data_set_string(settings_data, "server", QT_TO_UTF8(customServerEdit->text()));
+			obs_data_set_string(settings_data, "key", QT_TO_UTF8(keyEdit->text()));
+			return obs_service_create("rtmp_custom", "extra_custom", settings_data, nullptr);
+		} else {
+			obs_data_set_string(settings_data, "service", QT_TO_UTF8(serviceName));
+			QString serverVal = serverCombo->currentData().toString();
+			if (serverVal.isEmpty()) serverVal = serverCombo->currentText();
+			obs_data_set_string(settings_data, "server", QT_TO_UTF8(serverVal));
+			obs_data_set_string(settings_data, "key", QT_TO_UTF8(keyEdit->text()));
+			return obs_service_create("rtmp_common", "extra_common", settings_data, nullptr);
+		}
+	}
+};
+
+void OBSBasicSettings::on_addDestinationButton_clicked()
+{
+	ExtraDestinationWidget *w = new ExtraDestinationWidget(this, nullptr, ui->extraDestinationsContainer);
+	ui->extraDestinationsLayout->addWidget(w);
+	extraDestinationsWidgets.push_back(w);
+	Stream1Changed();
+}
+
 bool OBSBasicSettings::IsCustomService() const
 {
 	return ui->service->currentData().toInt() == (int)ListOpt::Custom;
@@ -90,6 +344,8 @@ void OBSBasicSettings::InitStreamPage()
 		&OBSBasicSettings::UpdateMultitrackVideo);
 	connect(ui->multitrackVideoConfigOverrideEnable, &QCheckBox::toggled, this,
 		&OBSBasicSettings::UpdateMultitrackVideo);
+	/* on_addDestinationButton_clicked is auto-connected by
+	 * connectSlotsByName; a manual connect here would fire it twice */
 }
 
 void OBSBasicSettings::LoadStream1Settings()
@@ -239,6 +495,19 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->ignoreRecommended->setChecked(ignoreRecommended);
 	ui->whipSimulcastTotalLayers->setValue(whipSimulcastTotalLayers);
 
+	for (auto *w : extraDestinationsWidgets) {
+		delete w;
+	}
+	extraDestinationsWidgets.clear();
+
+	for (auto &extra : main->extraDestinations) {
+		if (!extra)
+			continue;
+		ExtraDestinationWidget *w = new ExtraDestinationWidget(this, extra.Get(), ui->extraDestinationsContainer);
+		ui->extraDestinationsLayout->addWidget(w);
+		extraDestinationsWidgets.push_back(w);
+	}
+
 	loading = false;
 
 	QMetaObject::invokeMethod(this, "UpdateResFPSLimits", Qt::QueuedConnection);
@@ -330,6 +599,17 @@ void OBSBasicSettings::SaveStream1Settings()
 	}
 
 	main->SetService(newService);
+
+	main->extraDestinations.clear();
+	for (auto *w : extraDestinationsWidgets) {
+		if (!w)
+			continue;
+		obs_service_t *s = w->CreateService();
+		if (s) {
+			main->extraDestinations.emplace_back(s);
+		}
+	}
+
 	main->SaveService();
 	main->auth = auth;
 	if (!!main->auth) {

@@ -34,11 +34,13 @@ class OBSHotkeyWidget;
 class OBSPropertiesView;
 struct FFmpegFormat;
 struct OBSTheme;
+class ExtraDestinationWidget;
 
 std::string DeserializeConfigText(const char *value);
 
 class OBSBasicSettings : public QDialog {
 	Q_OBJECT
+	friend class ExtraDestinationWidget;
 	Q_PROPERTY(QIcon generalIcon READ GetGeneralIcon WRITE SetGeneralIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon appearanceIcon READ GetAppearanceIcon WRITE SetAppearanceIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon streamIcon READ GetStreamIcon WRITE SetStreamIcon DESIGNABLE true)
@@ -213,6 +215,7 @@ private:
 	QString lastCustomServer;
 	int prevLangIndex;
 	bool prevBrowserAccel;
+	std::vector<ExtraDestinationWidget *> extraDestinationsWidgets;
 
 	void ServiceChanged(bool resetFields = false);
 	QString FindProtocol();
@@ -242,6 +245,7 @@ private slots:
 	void on_useStreamKey_clicked();
 	void on_useAuth_toggled();
 	void on_server_currentIndexChanged(int index);
+	void on_addDestinationButton_clicked();
 
 	void on_hotkeyFilterReset_clicked();
 	void on_hotkeyFilterSearch_textChanged(const QString text);

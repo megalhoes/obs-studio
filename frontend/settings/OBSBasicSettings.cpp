@@ -4296,7 +4296,8 @@ void OBSBasicSettings::Stream1Changed()
 {
 	if (!loading) {
 		stream1Changed = true;
-		sender()->setProperty("changed", QVariant(true));
+		if (sender())
+			sender()->setProperty("changed", QVariant(true));
 		EnableApplyButton(true);
 	}
 }

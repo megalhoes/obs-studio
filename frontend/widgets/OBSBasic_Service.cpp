@@ -37,6 +37,19 @@ void OBSBasic::SaveService()
 	obs_data_set_string(data, "type", obs_service_get_type(service));
 	obs_data_set_obj(data, "settings", settings);
 
+	OBSDataArrayAutoRelease extraArray = obs_data_array_create();
+	for (size_t i = 0; i < extraDestinations.size(); i++) {
+		obs_service_t *s = extraDestinations[i].Get();
+		if (!s)
+			continue;
+		OBSDataAutoRelease sData = obs_data_create();
+		obs_data_set_string(sData, "type", obs_service_get_type(s));
+		OBSDataAutoRelease sSettings = obs_service_get_settings(s);
+		obs_data_set_obj(sData, "settings", sSettings);
+		obs_data_array_push_back(extraArray, sData);
+	}
+	obs_data_set_array(data, "extra_destinations", extraArray);
+
 	if (!obs_data_save_json_safe(data, jsonFilePath.u8string().c_str(), "tmp", "bak")) {
 		blog(LOG_WARNING, "Failed to save service");
 	}
@@ -71,6 +84,23 @@ bool OBSBasic::LoadService()
 
 	service = obs_service_create(type, "default_service", settings, hotkey_data);
 	obs_service_release(service);
+
+	extraDestinations.clear();
+	OBSDataArrayAutoRelease extraArray = obs_data_get_array(data, "extra_destinations");
+	if (extraArray) {
+		size_t count = obs_data_array_count(extraArray);
+		for (size_t i = 0; i < count; i++) {
+			OBSDataAutoRelease sData = obs_data_array_item(extraArray, i);
+			const char *sType = obs_data_get_string(sData, "type");
+			if (!sType || !*sType)
+				sType = "rtmp_common";
+			OBSDataAutoRelease sSettings = obs_data_get_obj(sData, "settings");
+			obs_service_t *s = obs_service_create(sType, "extra_service", sSettings, nullptr);
+			if (s) {
+				extraDestinations.emplace_back(s);
+			}
+		}
+	}
 
 	if (!service) {
 		return false;

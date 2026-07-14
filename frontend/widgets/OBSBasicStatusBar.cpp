@@ -2,6 +2,9 @@
 #include "ui_StatusBarWidget.h"
 
 #include <widgets/OBSBasic.hpp>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPolygonF>
 
 #include "moc_OBSBasicStatusBar.cpp"
 
@@ -34,12 +37,14 @@ OBSBasicStatusBar::OBSBasicStatusBar(QWidget *parent)
 	statusWidget->ui->recordTime->setDisabled(true);
 	statusWidget->ui->delayFrame->hide();
 	statusWidget->ui->issuesFrame->hide();
-	statusWidget->ui->kbps->hide();
+
+	statusWidget->ui->uploadFrame->hide();
 
 	addPermanentWidget(statusWidget, 1);
 	setMinimumHeight(statusWidget->height());
 
 	UpdateIcons();
+	UpdateSinksIcons();
 	connect(App(), &OBSApp::StyleChanged, this, &OBSBasicStatusBar::UpdateIcons);
 
 	messageTimer = new QTimer(this);
@@ -76,8 +81,9 @@ void OBSBasicStatusBar::Activate()
 		statusWidget->ui->streamIcon->setPixmap(streamingActivePixmap);
 		statusWidget->ui->streamTime->setDisabled(false);
 		statusWidget->ui->issuesFrame->show();
-		statusWidget->ui->kbps->show();
+		statusWidget->ui->uploadFrame->show();
 		firstCongestionUpdate = true;
+		UpdateSinksIcons();
 	}
 
 	if (recordOutput) {
@@ -100,11 +106,13 @@ void OBSBasicStatusBar::Deactivate()
 		statusWidget->ui->statusIcon->setPixmap(inactivePixmap);
 		statusWidget->ui->delayFrame->hide();
 		statusWidget->ui->issuesFrame->hide();
-		statusWidget->ui->kbps->hide();
+		statusWidget->ui->uploadFrame->hide();
+		statusWidget->ui->uploadRate->setText("0.0 KB/s");
 		totalStreamSeconds = 0;
 		congestionArray.clear();
 		disconnected = false;
 		firstCongestionUpdate = false;
+		UpdateSinksIcons();
 	}
 
 	if (!recordOutput) {
@@ -119,7 +127,7 @@ void OBSBasicStatusBar::Deactivate()
 
 		statusWidget->ui->delayInfo->setText("");
 		statusWidget->ui->droppedFrames->setText(QTStr("DroppedFrames").arg("0", "0.0"));
-		statusWidget->ui->kbps->setText("0 kbps");
+		statusWidget->ui->uploadRate->setText("0.0 KB/s");
 
 		delaySecTotal = 0;
 		delaySecStarting = 0;
@@ -129,6 +137,7 @@ void OBSBasicStatusBar::Deactivate()
 		overloadedNotify = true;
 
 		statusWidget->ui->statusIcon->setPixmap(inactivePixmap);
+		UpdateSinksIcons();
 	}
 }
 
@@ -186,20 +195,14 @@ void OBSBasicStatusBar::UpdateBandwidth()
 		lastBytesSent = 0;
 	}
 
-	uint64_t bitsBetween = (bytesSent - lastBytesSent) * 8;
-
 	double timePassed = double(bytesSentTime - lastBytesSentTime) / 1000000000.0;
 
-	double kbitsPerSec = double(bitsBetween) / timePassed / 1000.0;
+	double kbytesPerSec = double(bytesSent - lastBytesSent) / timePassed / 1024.0;
 
-	QString text;
-	text += QString::number(kbitsPerSec, 'f', 0) + QString(" kbps");
-
-	statusWidget->ui->kbps->setText(text);
-	statusWidget->ui->kbps->setMinimumWidth(statusWidget->ui->kbps->width());
-
-	if (!statusWidget->ui->kbps->isVisible()) {
-		statusWidget->ui->kbps->show();
+	statusWidget->ui->uploadRate->setText(QString::number(kbytesPerSec, 'f', 1) + QString(" KB/s"));
+	statusWidget->ui->uploadRate->setMinimumWidth(statusWidget->ui->uploadRate->width());
+	if (!statusWidget->ui->uploadFrame->isVisible()) {
+		statusWidget->ui->uploadFrame->show();
 	}
 
 	lastBytesSent = bytesSent;
@@ -460,6 +463,7 @@ void OBSBasicStatusBar::UpdateStatusBar()
 	OBSBasic *main = qobject_cast<OBSBasic *>(parent());
 
 	UpdateBandwidth();
+	UpdateSinksIcons();
 
 	if (streamOutput) {
 		UpdateStreamTime();
@@ -600,6 +604,177 @@ void OBSBasicStatusBar::UpdateIcons()
 
 	if (!recording) {
 		statusWidget->ui->recordIcon->setPixmap(recordingInactivePixmap);
+	}
+
+	UpdateSinksIcons();
+}
+
+static QPixmap GenerateSinkIconPixmap(const QString &serviceName, bool active, bool disconnected, bool connecting,
+				      qreal dpr)
+{
+	QPixmap pix(QSize(32, 32) * dpr);
+	pix.setDevicePixelRatio(dpr);
+	pix.fill(Qt::transparent);
+
+	QPainter p(&pix);
+	p.setRenderHint(QPainter::Antialiasing);
+
+	QColor bgColor = QColor("#808080");
+	if (active) {
+		QString nameLower = serviceName.toLower();
+		if (nameLower.contains("twitch"))
+			bgColor = QColor("#9146FF");
+		else if (nameLower.contains("youtube"))
+			bgColor = QColor("#FF0000");
+		else if (nameLower.contains("facebook"))
+			bgColor = QColor("#1877F2");
+		else if (nameLower.contains("restream"))
+			bgColor = QColor("#00C09B");
+		else
+			bgColor = QColor("#008080");
+	}
+
+	QRectF iconRect(2, 2, 24, 24);
+	p.setBrush(bgColor);
+	p.setPen(Qt::NoPen);
+	p.drawRoundedRect(iconRect, 6, 6);
+
+	p.setPen(Qt::white);
+	QFont f = p.font();
+	f.setBold(true);
+	f.setPixelSize(14);
+	p.setFont(f);
+	QString letter = serviceName.isEmpty() ? "C" : serviceName.left(1).toUpper();
+	p.drawText(iconRect, Qt::AlignCenter, letter);
+
+	if (active || disconnected || connecting) {
+		QColor dotColor = QColor("#00FF00");
+		if (disconnected)
+			dotColor = QColor("#FF0000");
+		else if (connecting)
+			dotColor = QColor("#FFA500");
+
+		QRectF dotBorderRect(20, 20, 10, 10);
+		p.setBrush(Qt::white);
+		p.drawEllipse(dotBorderRect);
+
+		QRectF dotRect(21.5, 21.5, 7, 7);
+		p.setBrush(dotColor);
+		p.drawEllipse(dotRect);
+	}
+
+	return pix;
+}
+
+/* obs_service_get_name() returns the instance name ("default_service",
+ * "extra_common"...); the branded name ("Twitch", "YouTube"...) lives in the
+ * "service" setting of rtmp_common services */
+static QString GetServiceDisplayName(obs_service_t *service)
+{
+	if (!service)
+		return QStringLiteral("Custom");
+
+	OBSDataAutoRelease settings = obs_service_get_settings(service);
+	const char *name = obs_data_get_string(settings, "service");
+	if (name && *name)
+		return QT_UTF8(name);
+
+	return QStringLiteral("Custom");
+}
+
+void OBSBasicStatusBar::UpdateSinksIcons()
+{
+	OBSBasic *main = qobject_cast<OBSBasic *>(parent());
+	if (!main || !statusWidget || !statusWidget->ui->sinksIconsLayout)
+		return;
+
+	struct SinkInfo {
+		QString name;
+		bool active = false;
+		bool disconnected = false;
+		bool connecting = false;
+	};
+	std::vector<SinkInfo> infoList;
+
+	obs_service_t *primaryService = main->GetService();
+	if (primaryService) {
+		SinkInfo sInfo;
+		sInfo.name = GetServiceDisplayName(primaryService);
+		if (streamOutput) {
+			OBSOutput output = OBSGetStrongRef(streamOutput);
+			if (output) {
+				sInfo.active = obs_output_active(output);
+				sInfo.connecting = obs_output_reconnecting(output);
+				sInfo.disconnected = disconnected;
+			}
+		}
+		infoList.push_back(sInfo);
+	}
+
+	if (streamOutput) {
+		OBSOutput output = OBSGetStrongRef(streamOutput);
+		if (output) {
+			proc_handler_t *ph = obs_output_get_proc_handler(output);
+			if (ph) {
+				long long count = 0;
+				calldata_t cdCount = {0};
+				if (proc_handler_call(ph, "get_sinks_count", &cdCount)) {
+					count = calldata_int(&cdCount, "count");
+				}
+				calldata_free(&cdCount);
+
+				for (long long i = 0; i < count; i++) {
+					calldata_t cd = {0};
+					calldata_set_int(&cd, "index", (long long)i);
+					if (proc_handler_call(ph, "get_sink_status", &cd)) {
+						SinkInfo sInfo;
+						const char *nameStr = calldata_string(&cd, "name");
+						sInfo.name = nameStr ? QT_UTF8(nameStr) : QString("Custom");
+						sInfo.active = calldata_bool(&cd, "active");
+						sInfo.disconnected = calldata_bool(&cd, "disconnected");
+						sInfo.connecting = calldata_bool(&cd, "connecting") || calldata_bool(&cd, "reconnecting");
+						infoList.push_back(sInfo);
+					}
+					calldata_free(&cd);
+				}
+			}
+		}
+	} else {
+		for (auto &extra : main->extraDestinations) {
+			obs_service_t *s = extra.Get();
+			if (!s)
+				continue;
+			SinkInfo sInfo;
+			sInfo.name = GetServiceDisplayName(s);
+			infoList.push_back(sInfo);
+		}
+	}
+
+	QHBoxLayout *layout = statusWidget->ui->sinksIconsLayout;
+	while (layout->count() > (int)infoList.size()) {
+		QLayoutItem *item = layout->takeAt(layout->count() - 1);
+		if (item->widget())
+			delete item->widget();
+		delete item;
+	}
+	while (layout->count() < (int)infoList.size()) {
+		QLabel *lbl = new QLabel(statusWidget->ui->sinksIconsWidget);
+		lbl->setFixedSize(32, 32);
+		layout->addWidget(lbl);
+	}
+
+	for (size_t i = 0; i < infoList.size(); i++) {
+		QLayoutItem *item = layout->itemAt((int)i);
+		if (!item || !item->widget())
+			continue;
+		QLabel *lbl = qobject_cast<QLabel *>(item->widget());
+		if (!lbl)
+			continue;
+
+		QPixmap pix = GenerateSinkIconPixmap(infoList[i].name, infoList[i].active, infoList[i].disconnected,
+						     infoList[i].connecting, lbl->devicePixelRatioF());
+		lbl->setPixmap(pix);
+		lbl->setToolTip(infoList[i].name);
 	}
 }
 

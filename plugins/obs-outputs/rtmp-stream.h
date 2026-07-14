@@ -57,6 +57,61 @@ struct dbr_interpolation_point {
 	long bitrates[MAX_OUTPUT_VIDEO_ENCODERS];
 };
 
+struct rtmp_sink {
+	struct rtmp_stream *parent;
+	char *name;
+	obs_service_t *service;
+
+	pthread_mutex_t packets_mutex;
+	struct deque packets;
+	bool sent_headers;
+
+	bool got_first_packet;
+	int64_t start_dts_offset;
+
+	volatile bool connecting;
+	pthread_t connect_thread;
+	bool connect_thread_valid;
+
+	volatile bool active;
+	volatile bool disconnected;
+	volatile bool encode_error;
+	volatile bool reconnecting;
+	uint64_t reconnect_time_ns;
+	bool wait_for_keyframe;
+	pthread_t send_thread;
+
+	os_sem_t *send_sem;
+	os_event_t *stop_event;
+	uint64_t stop_ts;
+
+	struct dstr path, key;
+	struct dstr username, password;
+	struct dstr encoder_name;
+	struct dstr bind_ip;
+	socklen_t addrlen_hint;
+
+	int64_t drop_threshold_usec;
+	int64_t pframe_drop_threshold_usec;
+	int min_priority;
+	float congestion;
+
+	int64_t last_dts_usec;
+	uint64_t total_bytes_sent;
+	int dropped_frames;
+
+	RTMP rtmp;
+
+	uint8_t *write_buf;
+	size_t write_buf_len;
+	size_t write_buf_size;
+	pthread_mutex_t write_buf_mutex;
+	os_event_t *buffer_space_available_event;
+	os_event_t *buffer_has_data_event;
+	os_event_t *socket_available_event;
+	os_event_t *send_thread_signaled_exit;
+};
+
 struct rtmp_stream {
 	obs_output_t *output;
 
@@ -137,11 +192,19 @@ struct rtmp_stream {
 	os_event_t *buffer_has_data_event;
 	os_event_t *socket_available_event;
 	os_event_t *send_thread_signaled_exit;
+
+	pthread_mutex_t sinks_mutex;
+	DARRAY(struct rtmp_sink *) sinks;
 };
 
 #ifdef _WIN32
 void *socket_thread_windows(void *data);
 #endif
+
+struct rtmp_sink *rtmp_stream_add_sink(struct rtmp_stream *stream, obs_service_t *service);
+void rtmp_stream_remove_sink(struct rtmp_stream *stream, struct rtmp_sink *sink);
+bool rtmp_sink_start(struct rtmp_sink *sink);
+void rtmp_sink_stop(struct rtmp_sink *sink);
 
 /* Adapted from FFmpeg's libavutil/pixfmt.h
  *

@@ -743,6 +743,20 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 		SetupVodTrack(service);
 	}
 
+	proc_handler_t *ph = obs_output_get_proc_handler(streamOutput);
+	if (ph && main) {
+		proc_handler_call(ph, "clear_sinks", nullptr);
+		for (auto &extra : main->extraDestinations) {
+			obs_service_t *s = extra.Get();
+			if (!s)
+				continue;
+			calldata_t cd = {0};
+			calldata_set_ptr(&cd, "service", s);
+			proc_handler_call(ph, "add_sink", &cd);
+			calldata_free(&cd);
+		}
+	}
+
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive) {
 			multitrackVideo->StartedStreaming();

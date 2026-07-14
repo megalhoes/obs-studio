@@ -1354,6 +1354,8 @@ public:
 	obs_service_t *GetService();
 	void SetService(obs_service_t *service);
 
+	std::vector<OBSServiceAutoRelease> extraDestinations;
+
 	void SaveService();
 	bool LoadService();
 
