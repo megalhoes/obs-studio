@@ -28,6 +28,7 @@
 
 #include <obs-module.h>
 
+#include <docks/MultChatDock.hpp>
 #ifdef YOUTUBE_ENABLED
 #include <docks/YouTubeAppDock.hpp>
 #endif
@@ -1252,6 +1253,13 @@ void OBSBasic::OBSInit()
 		NewYouTubeAppDock();
 	}
 #endif
+
+	/* MultChat: unified multistream chat window */
+	{
+		MultChatDock *multChat = new MultChatDock(this);
+		AddDockWidget(multChat, Qt::RightDockWidgetArea);
+		multChat->setVisible(false);
+	}
 
 	const char *dockStateStr = config_get_string(App()->GetUserConfig(), "BasicWindow", "DockState");
 

@@ -235,6 +235,8 @@ function(find_qt_plugins)
     iconengines
   )
   list(APPEND qt_plugins_Gui platforminputcontexts)
+  # QSslSocket (MultChat Twitch IRC) needs a TLS backend at runtime
+  list(APPEND qt_plugins_Network tls networkinformation)
   list(APPEND qt_plugins_Sql sqldrivers)
   list(APPEND qt_plugins_3dRender sceneparsers geometryloaders)
   list(APPEND qt_plugins_3dQuickRender renderplugins)

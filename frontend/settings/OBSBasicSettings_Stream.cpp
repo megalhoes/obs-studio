@@ -19,8 +19,13 @@ static const QUuid &CustomServerUUID()
 	return uuid;
 }
 
+#ifdef BROWSER_AVAILABLE
+#include <browser-panel.hpp>
+#else
 struct QCef;
 struct QCefCookieManager;
+class QCefWidget;
+#endif
 
 extern QCef *cef;
 extern QCefCookieManager *panel_cookies;
@@ -40,10 +45,12 @@ enum class Section : int {
 #include <QGroupBox>
 #include <QFormLayout>
 #include <QComboBox>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QStackedWidget>
 #include <components/UrlPushButton.hpp>
+#include <utility/MultChatTwitchAccount.hpp>
 
 class ExtraDestinationWidget : public QGroupBox {
 public:
@@ -57,6 +64,16 @@ public:
 	QStackedWidget *serverStacked = nullptr;
 	QString lastServiceName;
 
+	/* MultChat: per-destination chat credentials */
+	QFormLayout *formLayout = nullptr;
+	QWidget *multchatTwitchRow = nullptr;
+	QPushButton *multchatAuthBtn = nullptr;
+	QLabel *multchatLabel = nullptr;
+	QLineEdit *multchatVideoEdit = nullptr;
+	QWidget *multchatYouTubeRow = nullptr;
+	QPushButton *multchatYouTubeAuthBtn = nullptr;
+	QString multchatProfileId;
+
 	OBSBasicSettings *settings = nullptr;
 
 	ExtraDestinationWidget(OBSBasicSettings *settings_, obs_service_t *service = nullptr, QWidget *parent = nullptr)
@@ -64,6 +81,7 @@ public:
 	{
 		setTitle(QTStr("Basic.Settings.Stream.Destination"));
 		QFormLayout *layout = new QFormLayout(this);
+		formLayout = layout;
 		layout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 
 		serviceCombo = new QComboBox(this);
@@ -96,6 +114,36 @@ public:
 		keyLayout->addWidget(getKeyBtn);
 		layout->addRow(QTStr("Basic.AutoConfig.StreamPage.StreamKey"), keyLayout);
 
+		/* MultChat: Twitch account authorization / YouTube live id */
+		multchatAuthBtn = new QPushButton(QTStr("MultChat.Authorize"), this);
+		multchatAuthBtn->setCursor(Qt::PointingHandCursor);
+		multchatLabel = new QLabel(QTStr("MultChat.NotAuthorized"), this);
+		QHBoxLayout *multchatLayout = new QHBoxLayout();
+		multchatLayout->setContentsMargins(0, 0, 0, 0);
+		multchatLayout->addWidget(multchatAuthBtn);
+		multchatLayout->addWidget(multchatLabel, 1);
+		multchatTwitchRow = new QWidget(this);
+		multchatTwitchRow->setLayout(multchatLayout);
+		layout->addRow(QTStr("MultChat.RowLabel"), multchatTwitchRow);
+
+		multchatVideoEdit = new QLineEdit(this);
+		multchatVideoEdit->setPlaceholderText(QTStr("MultChat.VideoPlaceholder"));
+
+		multchatYouTubeAuthBtn = new QPushButton("Conectar YouTube / Studio", this);
+		multchatYouTubeAuthBtn->setCursor(Qt::PointingHandCursor);
+
+		QHBoxLayout *ytLayout = new QHBoxLayout();
+		ytLayout->setContentsMargins(0, 0, 0, 0);
+		ytLayout->addWidget(multchatVideoEdit, 1);
+		ytLayout->addWidget(multchatYouTubeAuthBtn);
+
+		multchatYouTubeRow = new QWidget(this);
+		multchatYouTubeRow->setLayout(ytLayout);
+		layout->addRow(QTStr("MultChat.RowLabel"), multchatYouTubeRow);
+
+		connect(multchatAuthBtn, &QPushButton::clicked, this, [this](bool) { OnMultChatAuthorize(); });
+		connect(multchatYouTubeAuthBtn, &QPushButton::clicked, this, [this](bool) { OnMultChatYouTubeAuthorize(); });
+
 		connect(serviceCombo, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
 			[this](int) {
 				if (serviceCombo->currentData().toInt() == (int)ListOpt::ShowAll) {
@@ -118,6 +166,9 @@ public:
 			const char *sService = obs_data_get_string(sSettings, "service");
 			const char *sServer = obs_data_get_string(sSettings, "server");
 			const char *sKey = obs_data_get_string(sSettings, "key");
+
+			multchatProfileId = QT_UTF8(obs_data_get_string(sSettings, "multchat_profile"));
+			multchatVideoEdit->setText(QT_UTF8(obs_data_get_string(sSettings, "multchat_video")));
 
 			int idx;
 			if (strcmp(obs_service_get_type(service), "rtmp_custom") == 0) {
@@ -149,6 +200,79 @@ public:
 		settings->HookWidget(serverCombo, &QComboBox::currentIndexChanged, &OBSBasicSettings::Stream1Changed);
 		settings->HookWidget(customServerEdit, &QLineEdit::textChanged, &OBSBasicSettings::Stream1Changed);
 		settings->HookWidget(keyEdit, &QLineEdit::textChanged, &OBSBasicSettings::Stream1Changed);
+		settings->HookWidget(multchatVideoEdit, &QLineEdit::textChanged, &OBSBasicSettings::Stream1Changed);
+	}
+
+	void OnMultChatAuthorize()
+	{
+		MultChatTwitchAccount *account = MultChatTwitchAccount::Authorize(settings);
+		if (!account) {
+			return;
+		}
+
+		multchatProfileId = account->ProfileId();
+		if (!account->StreamKey().isEmpty()) {
+			keyEdit->setText(account->StreamKey());
+		}
+
+		UpdateMultChatUi();
+		settings->Stream1Changed();
+	}
+
+	void OnMultChatYouTubeAuthorize()
+	{
+#ifdef BROWSER_AVAILABLE
+		if (!cef) {
+			QMessageBox::warning(this, QTStr("MultChat.SetupYouTube.Title"), QTStr("MultChat.YouTube.Unavailable"));
+			return;
+		}
+		OBSBasic::InitBrowserPanelSafeBlock();
+
+		QDialog dlg(this);
+		dlg.setWindowTitle("Conectar Conta do YouTube / Studio (Autenticação OBS Browser)");
+		dlg.resize(900, 750);
+		Qt::WindowFlags flags = dlg.windowFlags();
+		dlg.setWindowFlags(flags & (~Qt::WindowContextHelpButtonHint));
+
+		QCefWidget *browser = cef->create_widget(&dlg, "https://studio.youtube.com", panel_cookies);
+		if (!browser) {
+			QMessageBox::warning(this, QTStr("MultChat.SetupYouTube.Title"), QTStr("MultChat.YouTube.Unavailable"));
+			return;
+		}
+
+		QVBoxLayout *layout = new QVBoxLayout(&dlg);
+		layout->addWidget(browser, 1);
+
+		QPushButton *closeBtn = new QPushButton(QTStr("Close"), &dlg);
+		connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+		QHBoxLayout *btnLayout = new QHBoxLayout();
+		btnLayout->addStretch();
+		btnLayout->addWidget(closeBtn);
+		layout->addLayout(btnLayout);
+
+		dlg.exec();
+#else
+		QMessageBox::warning(this, QTStr("MultChat.SetupYouTube.Title"), QTStr("MultChat.YouTube.Unavailable"));
+#endif
+	}
+
+	void UpdateMultChatUi()
+	{
+		QString serviceName = serviceCombo->currentText();
+		bool custom = IsCustomSelected();
+		bool isTwitch = !custom && serviceName.contains("Twitch", Qt::CaseInsensitive);
+		bool isYouTube = !custom && serviceName.contains("YouTube", Qt::CaseInsensitive);
+
+		formLayout->setRowVisible(multchatTwitchRow, isTwitch);
+		formLayout->setRowVisible(multchatYouTubeRow ? multchatYouTubeRow : multchatVideoEdit, isYouTube);
+
+		if (isTwitch) {
+			MultChatTwitchAccount *account = multchatProfileId.isEmpty()
+								 ? nullptr
+								 : MultChatTwitchAccount::Load(multchatProfileId);
+			multchatLabel->setText(account ? QTStr("MultChat.Account").arg(account->DisplayName())
+						       : QTStr("MultChat.NotAuthorized"));
+		}
 	}
 
 	void OnShowClicked()
@@ -260,9 +384,11 @@ public:
 				getKeyBtn->hide();
 			}
 		}
+
+		UpdateMultChatUi();
 	}
 
-	obs_service_t *CreateService()
+	obs_service_t *CreateService(const char *name = "extra_service")
 	{
 		QString serviceName = serviceCombo->currentText();
 		bool custom = IsCustomSelected();
@@ -271,14 +397,33 @@ public:
 		if (custom) {
 			obs_data_set_string(settings_data, "server", QT_TO_UTF8(customServerEdit->text()));
 			obs_data_set_string(settings_data, "key", QT_TO_UTF8(keyEdit->text()));
-			return obs_service_create("rtmp_custom", "extra_custom", settings_data, nullptr);
+			return obs_service_create("rtmp_custom", name, settings_data, nullptr);
 		} else {
 			obs_data_set_string(settings_data, "service", QT_TO_UTF8(serviceName));
 			QString serverVal = serverCombo->currentData().toString();
 			if (serverVal.isEmpty()) serverVal = serverCombo->currentText();
 			obs_data_set_string(settings_data, "server", QT_TO_UTF8(serverVal));
 			obs_data_set_string(settings_data, "key", QT_TO_UTF8(keyEdit->text()));
-			return obs_service_create("rtmp_common", "extra_common", settings_data, nullptr);
+
+			if (!multchatProfileId.isEmpty()) {
+				obs_data_set_string(settings_data, "multchat_profile", QT_TO_UTF8(multchatProfileId));
+			}
+			QString multchatVideo = multchatVideoEdit->text().trimmed();
+			if (!multchatVideo.isEmpty()) {
+				obs_data_set_string(settings_data, "multchat_video", QT_TO_UTF8(multchatVideo));
+			}
+
+			return obs_service_create("rtmp_common", name, settings_data, nullptr);
+		}
+	}
+
+	/* Primary destination (index 0) maps to the main output service; its
+	 * server list is chosen automatically and it cannot be removed. */
+	void SetPrimary(bool primary)
+	{
+		setTitle(primary ? QTStr("MultChat.PrimaryDestination") : QTStr("Basic.Settings.Stream.Destination"));
+		if (removeBtn) {
+			removeBtn->setVisible(!primary);
 		}
 	}
 };
@@ -299,6 +444,26 @@ bool OBSBasicSettings::IsCustomService() const
 inline bool OBSBasicSettings::IsWHIP() const
 {
 	return ui->service->currentData().toInt() == (int)ListOpt::WHIP;
+}
+
+/* The native multistream makes the destinations list the single place to
+ * configure channels. Hide the legacy single-service controls (service
+ * dropdown, server, stream key, account login, custom auth) so only the
+ * destinations list and the "add destination" button remain. Called at the
+ * end of LoadStream1Settings so it wins over the per-service show/hide logic
+ * that runs during loading. */
+void OBSBasicSettings::HideLegacyServiceUI()
+{
+	ui->serviceLabel->setVisible(false);
+	ui->serviceWidget->setVisible(false);
+	ui->streamStackWidget->setCurrentWidget(ui->streamKeyPage);
+
+	/* destinationLayout rows 0..8 are the legacy server/key/account/auth
+	 * fields; rows 9..10 are the destinations list and the add button. */
+	for (int row = 0; row <= 8; row++) {
+		ui->destinationLayout->setRowVisible(row, false);
+	}
+	ui->destinationGroupBox->setTitle(QString());
 }
 
 void OBSBasicSettings::InitStreamPage()
@@ -500,6 +665,17 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 	extraDestinationsWidgets.clear();
 
+	/* The native multistream replaces the legacy single-service UI: the
+	 * destinations list is the whole surface. Destination #1 is the main
+	 * output service; the rest are extra RTMP sinks. */
+	{
+		ExtraDestinationWidget *primary =
+			new ExtraDestinationWidget(this, service_obj, ui->extraDestinationsContainer);
+		primary->SetPrimary(true);
+		ui->extraDestinationsLayout->addWidget(primary);
+		extraDestinationsWidgets.push_back(primary);
+	}
+
 	for (auto &extra : main->extraDestinations) {
 		if (!extra)
 			continue;
@@ -509,6 +685,8 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 
 	loading = false;
+
+	HideLegacyServiceUI();
 
 	QMetaObject::invokeMethod(this, "UpdateResFPSLimits", Qt::QueuedConnection);
 }
@@ -592,7 +770,16 @@ void OBSBasicSettings::SaveStream1Settings()
 		obs_data_set_string(settings, "key", QT_TO_UTF8(ui->key->text()));
 	}
 
-	OBSServiceAutoRelease newService = obs_service_create(service_id, "default_service", settings, hotkeyData);
+	OBSServiceAutoRelease newService;
+
+	/* The destinations list is authoritative: widget[0] is the main
+	 * output service, widgets[1..] are the extra RTMP sinks. Fall back to
+	 * the legacy service_id path only if the list is somehow empty. */
+	if (!extraDestinationsWidgets.empty() && extraDestinationsWidgets.front()) {
+		newService = extraDestinationsWidgets.front()->CreateService("default_service");
+	} else {
+		newService = obs_service_create(service_id, "default_service", settings, hotkeyData);
+	}
 
 	if (!newService) {
 		return;
@@ -601,7 +788,8 @@ void OBSBasicSettings::SaveStream1Settings()
 	main->SetService(newService);
 
 	main->extraDestinations.clear();
-	for (auto *w : extraDestinationsWidgets) {
+	for (size_t i = 1; i < extraDestinationsWidgets.size(); i++) {
+		ExtraDestinationWidget *w = extraDestinationsWidgets[i];
 		if (!w)
 			continue;
 		obs_service_t *s = w->CreateService();

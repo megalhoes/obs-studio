@@ -23,6 +23,13 @@ target_sources(
     utility/MissingFilesModel.hpp
     utility/MissingFilesPathItemDelegate.cpp
     utility/MissingFilesPathItemDelegate.hpp
+    utility/MultChatCommon.hpp
+    utility/MultChatTwitchAccount.cpp
+    utility/MultChatTwitchAccount.hpp
+    utility/MultChatTwitchIrc.cpp
+    utility/MultChatTwitchIrc.hpp
+    utility/MultChatYouTubeBridge.cpp
+    utility/MultChatYouTubeBridge.hpp
     utility/MultitrackVideoError.cpp
     utility/MultitrackVideoError.hpp
     utility/MultitrackVideoOutput.cpp

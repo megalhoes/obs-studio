@@ -205,6 +205,7 @@ private:
 
 	/* stream */
 	void InitStreamPage();
+	void HideLegacyServiceUI();
 	bool IsCustomService() const;
 	inline bool IsWHIP() const;
 	void LoadServices(bool showAll);
